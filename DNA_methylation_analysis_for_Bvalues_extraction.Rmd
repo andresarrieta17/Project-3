@@ -1,0 +1,195 @@
+---
+title: "DNA_methylation_analysis_for_Bvalues_extraction"
+author: "Victor A. Arrieta"
+date: "2025-05-12"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# ─────────── 0. Setup ───────────
+library(minfi)           # for methylation preprocessing
+library(tidyverse)       # for data wrangling
+library(preprocessCore)  # for any post-hoc quantile work, if needed
+
+```
+
+```{r}
+idat_dir  <- file.path(pkgPath, "IDHwtGBM_methylation_files_Columbia_New")
+meta_csv  <- file.path(pkgPath, "inputSheet_new_dx_GBM.csv")
+
+set.seed(33)
+```
+
+```{r}
+# ─────────── 1. Build sampleSheet & merge clinical metadata ───────────
+idat_files <- list.files(idat_dir, pattern="\\.idat$", full.names=TRUE)
+red_files  <- grep("_Red\\.idat$", idat_files, value=TRUE)
+grn_files  <- sub("_Red\\.idat$", "_Grn.idat", red_files)
+sample_names <- basename(red_files) %>% str_remove("_Red\\.idat$")
+
+sampleSheet <- tibble(
+  Sample_Name = sample_names,
+  Red_File    = red_files,
+  Grn_File    = grn_files
+)
+```
+
+```{r}
+# load your clinical sheet and build matching Sample_Name
+clin        <- read_csv(meta_csv, col_types=cols())
+clin <- clin %>%
+  mutate(Sample_Name = paste(chip_id, index, sep="_"))
+
+# merge, keeping only those IDAT’d
+mergedData <- sampleSheet %>%
+  left_join(clin, by="Sample_Name") %>%
+  select(Sample_Name, everything())
+
+# write mergedData for record
+write_csv(mergedData, file.path(pkgPath, "mergedData.csv"))
+
+```
+
+```{r}
+# 1) Add the Basename column (path + sample name prefix)
+mergedData$Basename <- file.path(idat_dir, mergedData$Sample_Name)
+
+# 2) Now read the IDATs—read.metharray.exp will append “_Grn.idat” and “_Red.idat”
+rgSet <- read.metharray.exp(
+  base     = idat_dir,
+  targets  = mergedData,
+  extended = TRUE
+)
+
+# Quick check:
+rgSet
+pData(rgSet)
+
+```
+
+```{r}
+# give each column the descriptive sample_id from your mergedData
+sampleNames(rgSet) <- mergedData$sample_id
+
+# compute detection p-values and drop arrays with mean ≥ 0.05
+detP       <- detectionP(rgSet)
+mean_detP  <- colMeans(detP)
+keep       <- mean_detP < 0.05
+rgSet_clean <- rgSet[, keep]
+
+```
+
+```{r}
+# ─────────── 3. Per‐array background & dye‐bias correction (NOOB) ───────────
+mSet_noob <- preprocessNoob(rgSet_clean)
+
+```
+
+```{r}
+# ─────────── 4. (Optional) QC plot of β densities ───────────
+pdf("beta_density_post_NOOB.pdf", width=7, height=5)
+densityPlot(
+  mSet_noob,
+  sampGroups = pData(mSet_noob)$Sample_Group,
+  main       = "β‐value density after NOOB",
+  legend     = TRUE
+)
+dev.off()
+
+```
+
+```{r}
+# (Re-)create the raw MethylSet from your cleaned RGSet
+mSet_raw  <- preprocessRaw(rgSet_clean)
+mSet_noob <- preprocessNoob(rgSet_clean)
+beta_raw  <- getBeta(mSet_raw)
+beta_noob <- getBeta(mSet_noob)
+
+# 2) Pick e.g. 20 random samples to avoid over-plotting
+set.seed(42)
+samps <- sample(ncol(beta_raw), 20)
+
+```
+
+
+```{r}
+# 3) Compute mean densities on a common grid
+grid_pts <- seq(0, 1, length.out = 512)
+
+# helper to get a clean density vector
+get_density_y <- function(vec) {
+  vec2 <- vec[!is.na(vec)]
+  density(vec2, from = 0, to = 1, n = length(grid_pts))$y
+}
+
+dens_raw_mat <- sapply(samps, function(i) get_density_y(beta_raw[, i]))
+dens_noob_mat<- sapply(samps, function(i) get_density_y(beta_noob[, i]))
+
+mean_raw  <- rowMeans(dens_raw_mat)
+mean_noob <- rowMeans(dens_noob_mat)
+
+# 4) Determine y-axis limit
+ylim_max <- max(mean_raw, mean_noob) * 1.1
+
+# 5) Plot with expanded ylim
+pdf(file.path(pkgPath, "mean_raw_vs_noob_density_expanded_ylim.pdf"), width = 7, height = 5)
+plot(grid_pts, mean_raw,
+     type  = "l", lwd = 2, col = "gray60",
+     xlab  = "Beta value", ylab = "Density",
+     main  = "Average Raw vs NOOB β-density",
+     xlim  = c(0, 1), ylim = c(0, ylim_max)
+)
+lines(grid_pts, mean_noob, lwd = 2, col = "forestgreen")
+legend("topright",
+       legend = c("Mean Raw", "Mean NOOB"),
+       col    = c("gray60", "forestgreen"),
+       lty    = 1, lwd = 2, bty = "n"
+)
+dev.off()
+
+```
+
+
+```{r}
+# 1) Define the samples to exclude
+exclude_samples <- c("PJ030 D1", "PJ048")
+
+# 2) Verify they’re present
+colnames(mSet_noob)[ colnames(mSet_noob) %in% exclude_samples ]
+
+# 3) Subset your MethylSet to drop them
+keep_idx      <- !(colnames(mSet_noob) %in% exclude_samples)
+mSet_filtered <- mSet_noob[, keep_idx]
+
+# 4) Extract β-values and metadata from the filtered object
+beta_mat_filt <- getBeta(mSet_filtered)
+meta <- as.data.frame(colData(mSet_filtered))
+
+# Columns you want to keep
+wanted <- c(
+  "Sample_Name",
+  "sample_id",
+  "Sample_Group",
+  "class",
+  "Status",
+  "Days",
+  "pERK"
+)
+
+# Select only those that exist
+meta_sub <- meta %>%
+  select(any_of(wanted))
+
+# 5) Export filtered data
+write.csv(beta_mat_filt,
+          file = file.path(pkgPath, "beta_values_filtered.csv"),
+          row.names = TRUE)
+write.csv(meta_sub,
+          file = file.path(pkgPath, "beta_metadata_filtered.csv"),
+          row.names = FALSE)
+
+
+```
+
